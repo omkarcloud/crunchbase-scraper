@@ -59,6 +59,8 @@ python run.py
 
 Crunchbase sits behind Cloudflare, so the first request opens Chrome for a few seconds to clear it. Every request after that is plain HTTP.
 
+Running thousands of calls from one IP? Cloudflare can block that IP for a few hours. Set `CRUNCHBASE_PROXY=http://user:pass@host:port` and keep going.
+
 3️⃣ Get your first data:
 ```bash
 curl "http://localhost:8000/companies/details?company=openai"

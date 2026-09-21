@@ -29,7 +29,7 @@ CRUNCHBASE_PROXY_COUNTRY = "proxy" if CRUNCHBASE_PROXY else None   # set = every
 CRUNCHBASE_FALLBACK_PROXY_COUNTRY = None   # no fallback exit: the proxy comes from CRUNCHBASE_PROXY
 CRUNCHBASE_ORG_QUOTA = 10                  # company-profile requests per session
 CRUNCHBASE_IDENTITY_TTL = 1500             # seconds a session is trusted
-CRUNCHBASE_HARVEST_ATTEMPTS = 1            # tries to open a session through the proxy
+CRUNCHBASE_HARVEST_ATTEMPTS = 3            # tries to open a session through the proxy
 CRUNCHBASE_HARVEST_TIMEOUT = 60            # seconds for Cloudflare to clear
 CRUNCHBASE_HARVEST_COOLDOWN = 180          # seconds to wait after a failed attempt
 CRUNCHBASE_RATE_LIMIT_COOLDOWN = 150       # seconds to rest after a Cloudflare rate limit

@@ -392,11 +392,26 @@ class _Browser:
                     raise RuntimeError(f"Cloudflare challenge did not clear (clicks={clicks})")
                 due = (last_click is None and elapsed >= 3) or \
                       (last_click is not None and time.monotonic() - last_click >= CLICK_EVERY)
-                if due and clicks < MAX_CLICKS and driver.call(_click_turnstile):
+                try:
+                    clicked = due and clicks < MAX_CLICKS and driver.call(_click_turnstile)
+                except Exception:
+                    clicked = False          # the frame navigated under the click
+                if clicked:
                     clicks += 1
                     last_click = time.monotonic()
                 time.sleep(HARVEST_POLL)
-            ua = driver.evaluate("navigator.userAgent")
+            # Cloudflare reloads the page right after it clears, so an evaluate
+            # can land mid-navigation ("Execution context was destroyed"):
+            # retry until the new document answers.
+            ua = None
+            for _ in range(10):
+                try:
+                    ua = driver.evaluate("navigator.userAgent")
+                    break
+                except Exception:
+                    time.sleep(1)
+            if not ua:
+                raise RuntimeError("the page never settled after the challenge")
             cookies = {c["name"]: c["value"] for c in driver.call(lambda page: page.context.cookies(SITE))}
             clearance = cookies.get("cf_clearance")
             if clearance and clearance == self.last_clearance:
