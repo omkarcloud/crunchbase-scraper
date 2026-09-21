@@ -1,0 +1,8 @@
+bottle
+cheroot
+curl_cffi
+marshmallow
+patchright
+psutil
+pyvirtualdisplay
+pytest

@@ -1,0 +1,11 @@
+services:
+  crunchbase-scraper:
+    build: .
+    restart: unless-stopped
+    shm_size: "1gb"
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — a clean home IP needs no proxy, so leave this unset.
+      # - CRUNCHBASE_PROXY=http://user:pass@host:port
