@@ -10,10 +10,12 @@ hides behind preview_properties (funding total, founded date, website,
 rank, scores…) come from the company's own row in the organization search,
 which is free of that quota — one POST, merged in by parsers.organization.
 
-List cards return 10 rows per call and page with `after_id`; page N of an
-investors / people list therefore costs N-1 extra quota units, while
-funding rounds, acquisitions, news and events are served by searches
-(15 rows, cursor-walked, no quota).
+List cards return 10 rows per call and page with `after_id`; a cold page N
+of an investors / people list therefore costs N-1 extra quota units (one
+when pages 1..N-1 were read within shared.CURSOR_TTL: shared.card_pages
+memoises the after_id each hop ends on), while funding rounds,
+acquisitions, news and events are served by searches (15 rows,
+cursor-walked, no quota).
 """
 from crunchbase import fetch, parsers, refs, shared
 from crunchbase.discover import COMPANY_FIELDS
@@ -23,11 +25,15 @@ ENTITY_TTL = 6 * 3600
 CARD_PAGE = fetch.CARD_PAGE
 _entities = shared._TTLCache(ttl=ENTITY_TTL, max_size=400)
 _rows = shared._TTLCache(ttl=ENTITY_TTL, max_size=2000)
+_names = shared._TTLCache(ttl=ENTITY_TTL, max_size=2000)      # company name -> ref
 
+# investor_identifiers comes back gated, but its preview placeholder carries
+# the list's length: the round's investor count (parsers._investors_count).
+# num_relationships is NOT an investor count (30 for a 16-investor round).
 ROUND_FIELDS = ["identifier", "short_description", "announced_on", "closed_on", "funded_organization_identifier",
                 "funded_organization_funding_total", "funded_organization_diversity_spotlights", "investment_type",
                 "money_raised", "target_money_raised", "pre_money_valuation", "lead_investor_identifiers",
-                "investor_identifiers", "rank_funding_round", "num_relationships"]
+                "investor_identifiers", "rank_funding_round"]
 ACQUISITION_FIELDS = ["identifier", "short_description", "announced_on", "completed_on", "acquirer_identifier",
                       "acquirer_categories", "acquirer_locations", "acquirer_funding_total", "acquiree_identifier",
                       "acquiree_categories", "acquiree_locations", "acquiree_funding_total",
@@ -90,7 +96,7 @@ def _card_page(company, data, card_id, page):
     first = (data.get("cards") or {}).get(card_id) or []
     if page == 1:
         return first
-    return fetch.card_pages("organizations", company["id"], card_id, page, first_rows=first)
+    return shared.card_pages("organizations", company["id"], card_id, page, first_rows=first)
 
 
 def _card_pagination(page, rows, total=None, first_len=None):
@@ -110,8 +116,43 @@ def _card_pagination(page, rows, total=None, first_len=None):
 
 # ---- profile views ---------------------------------------------------------------------
 
+name_spellings = shared.name_spellings      # kept here: the company lookup's own names
+pick_named = shared.pick_named
+
+
+def _named(name):
+    """A company name -> its ref ({"id": permalink, "kind"}), through the
+    search typeahead (shared.find_named, no organization quota). Memoised."""
+    key = refs.name_key(name)
+    hit = _names.get(key)
+    if hit:
+        return hit
+    ident = shared.find_named("organizations", name)
+    if not ident:
+        raise fetch.CrunchbaseNotFound(f"no company named '{name}' on Crunchbase")
+    ref = {"id": ident.get("permalink") or ident.get("uuid"), "kind": "organization"}
+    _names.put(key, ref)
+    return ref
+
+
 def details(company):
-    data = _entity(company)
+    """`company` is a permalink / uuid / link ref, or a name ({"id": None,
+    "name": …}). A bare word that is no permalink ("tesla": the permalink
+    is tesla-motors) is retried as a name before it is reported missing."""
+    if company.get("id") is None:
+        company = _named(company["name"])
+    try:
+        data = _entity(company)
+    except fetch.CrunchbaseNotFound:
+        if company.get("kind") or refs.is_uuid(company["id"]):     # a link, a uuid or a looked-up name: final
+            raise
+        try:
+            named = _named(shared.slug_words(company["id"]) or company["id"])
+        except fetch.CrunchbaseNotFound:
+            named = None
+        if not named or named["id"] == company["id"]:
+            raise
+        data = _entity(named)
     return parsers.organization(data, _row(_uuid(data)))
 
 
@@ -340,8 +381,8 @@ def timeline(company, page=1):
     if page == 1:
         rows = parsers._get(cards, "overview_timeline", "entities") or []
     else:
-        rows = fetch.card_pages("organizations", company["id"], "overview_timeline", page,
-                                first_rows=parsers._get(cards, "overview_timeline", "entities") or [])
+        rows = shared.card_pages("organizations", company["id"], "overview_timeline", page,
+                                 first_rows=parsers._get(cards, "overview_timeline", "entities") or [])
         if isinstance(rows, dict):
             rows = rows.get("entities") or []
     total = parsers._get(cards, "overview_timeline", "count")

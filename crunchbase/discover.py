@@ -90,6 +90,12 @@ def search_companies(query=None, description=None, category=None, category_group
     field, direction = refs.COMPANY_SORTS[sort]
     result, _ = paged_search("organization.companies", COMPANY_FIELDS, q, field, direction, page,
                              parsers.organization_summary)
+    if operating_status:
+        # Crunchbase lets a visitor filter on operating_status but not select
+        # it (MD403), so a search row carries null. Under the filter every
+        # row has the status asked for.
+        for item in result.get("items") or []:
+            item["operating_status"] = operating_status
     result["sort"] = sort
     return result
 

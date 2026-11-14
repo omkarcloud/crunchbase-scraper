@@ -74,6 +74,11 @@ class CompanyField(RefField):
     resolver = staticmethod(refs.resolve_company)
 
 
+class CompanyOrNameField(RefField):
+    """A company permalink, uuid or link, or its plain name (looked up by the endpoint)."""
+    resolver = staticmethod(refs.resolve_company_or_name)
+
+
 class PersonField(RefField):
     resolver = staticmethod(refs.resolve_person)
 
@@ -112,6 +117,13 @@ class OptionalEntityField(EntityField):
         kwargs.setdefault("required", False)
         kwargs.setdefault("load_default", None)
         super().__init__(**kwargs)
+
+
+class OptionalInvestorField(OptionalEntityField):
+    """An investor filter: a company or person permalink, uuid or link, or its
+    plain name ("Sequoia Capital"). Names and permalinks Crunchbase does not
+    have are looked up among investors (shared.entity_uuid_any)."""
+    resolver = staticmethod(refs.resolve_entity_or_name)
 
 
 class OptionalCompanyField(CompanyField):
@@ -203,7 +215,7 @@ class CompanySearchSchema(BaseSchema):
     min_contacts = PositiveInt()
     min_growth_score = ScoreField()
     min_heat_score = ScoreField()
-    investor = OptionalEntityField()
+    investor = OptionalInvestorField()
     founder = OptionalPersonField()
     hub_tag = StrippedString(load_default=None, validate=validate.Length(min=1, max=40))
     investor_type = ChoiceField(INVESTOR_TYPES)
@@ -283,6 +295,10 @@ class CompanySchema(BaseSchema):
     company = CompanyField()
 
 
+class CompanyDetailsSchema(BaseSchema):
+    company = CompanyOrNameField()
+
+
 class CompanyPagedSchema(CompanySchema):
     page = _page()
 
@@ -334,8 +350,8 @@ class PersonEventsSchema(PersonSchema):
 
 class FundingRoundSearchSchema(BaseSchema):
     company = OptionalCompanyField()
-    investor = OptionalEntityField()
-    lead_investor = OptionalEntityField()
+    investor = OptionalInvestorField()
+    lead_investor = OptionalInvestorField()
     category = NameOrSlugField()
     location = NameOrSlugField()
     round_type = CommaListField(allowed=FUNDING_TYPES, upper=False, max_items=10)

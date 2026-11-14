@@ -47,6 +47,167 @@ def test_resolve_company_rejects(value):
         refs.resolve_company(value)
 
 
+@pytest.mark.parametrize("value,expected", [
+    ("stripe", {"id": "stripe", "kind": None}),                                    # still a permalink
+    ("https://www.crunchbase.com/organization/stripe", {"id": "stripe", "kind": "organization"}),
+    ("Stripe, Inc.", {"id": None, "kind": "organization", "name": "Stripe, Inc."}),
+    ("  Open   AI ", {"id": None, "kind": "organization", "name": "Open AI"}),
+])
+def test_resolve_company_or_name(value, expected):
+    assert refs.resolve_company_or_name(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "https://www.crunchbase.com/person/sam-altman",      # a link is never read as a name
+    "https://www.linkedin.com/company/stripe",
+    "",
+    "!!!",                                               # no letter or digit: names nothing
+])
+def test_resolve_company_or_name_rejects(value):
+    with pytest.raises(ValueError):
+        refs.resolve_company_or_name(value)
+
+
+def test_name_key_reads_every_script_and_folds_accents():
+    assert refs.name_key("Open AI") == refs.name_key("open-ai") == "openai"
+    assert refs.name_key("Nestlé") == refs.name_key("Nestle") == "nestle"
+    assert refs.name_key("Škoda") == "skoda" != refs.name_key("Koda")
+    assert refs.name_key("Яндекс") == "яндекс" and refs.name_key("字节跳动") == "字节跳动"
+    assert refs.name_key("की") != refs.name_key("का")                 # a vowel sign is part of the word
+    assert refs.name_key(" . ") == "" and refs.name_key(None) == ""
+    assert refs.resolve_company_or_name("Яндекс") == {"id": None, "kind": "organization", "name": "Яндекс"}
+
+
+def test_company_details_takes_a_name():
+    data, err = load_query(schemas.CompanyDetailsSchema, {"company": "Open AI"})
+    assert err is None and data == {"company": {"id": None, "kind": "organization", "name": "Open AI"}}
+    _, err = load_query(schemas.CompanySchema, {"company": "Open AI"})          # the other views stay strict
+    assert err and "company" in err["errors"]
+
+
+def _named_rows(*names):
+    return [{"identifier": {"value": n, "permalink": n.lower().replace(" ", "-"), "uuid": None}} for n in names]
+
+
+def test_pick_named():
+    from crunchbase import companies
+    rows = _named_rows("OpenAI Startup Fund", "OpenAI", "Open AI Labs")
+    assert companies.pick_named(rows, "Open AI")["identifier"]["value"] == "OpenAI"          # exact, spacing aside
+    assert companies.pick_named(rows, "openai startup")["identifier"]["value"] == "OpenAI Startup Fund"   # best-ranked prefix
+    assert companies.pick_named(rows, "openai startup", exact_only=True) is None
+    assert companies.pick_named(_named_rows("Applied OpenAI"), "OpenAI") is None             # contains is another company
+    assert companies.pick_named(rows, " ") is None
+    assert companies.name_spellings("Stripe, Inc.") == ["Stripe, Inc.", "Stripe"]
+    assert companies.name_spellings("Open AI") == ["Open AI", "OpenAI"]
+    assert companies.name_spellings("Inc") == ["Inc"]
+    assert companies.name_spellings("Nestlé S.A.") == ["Nestlé S.A.", "Nestlé"]             # a dotted suffix
+    assert companies.name_spellings("Acme Co., Ltd.") == ["Acme Co., Ltd.", "Acme"]
+    assert companies.pick_named(_named_rows("Koda", "Škoda Auto"), "Škoda")["identifier"]["value"] == "Škoda Auto"
+    assert companies.pick_named(_named_rows("Яндекс"), "яндекс")["identifier"]["value"] == "Яндекс"
+
+
+def test_details_looks_a_name_up_and_retries_a_missing_permalink(monkeypatch):
+    from crunchbase import companies, fetch
+    monkeypatch.setattr(companies, "_names", shared._TTLCache(ttl=60, max_size=10))
+    searched, fetched = [], []
+
+    def typeahead(collection, query):
+        searched.append(query)
+        return (_named_rows("Tesla") if query.lower() == "tesla" else []), 0
+
+    def entity(company):
+        fetched.append(company["id"])
+        if company["id"] != "tesla":
+            raise fetch.CrunchbaseNotFound(f"company '{company['id']}' not found on Crunchbase")
+        return {"properties": {"identifier": {"uuid": "u-tesla"}}}
+
+    monkeypatch.setattr(fetch, "_typeahead", typeahead)
+    monkeypatch.setattr(companies, "_entity", entity)
+    monkeypatch.setattr(companies, "_row", lambda uuid: {})
+    monkeypatch.setattr(companies.parsers, "organization", lambda data, extra: {"uuid": companies._uuid(data)})
+    assert companies.details({"id": None, "kind": "organization", "name": "Tesla, Inc."}) == {"uuid": "u-tesla"}
+    assert searched == ["Tesla, Inc.", "Tesla"] and fetched == ["tesla"]
+    # a bare word that is no permalink is retried as a name; a link or a uuid is final
+    fetched.clear()
+    monkeypatch.setattr(companies, "_named", lambda name: {"id": "tesla", "kind": "organization"})
+    assert companies.details({"id": "tesla-inc", "kind": None}) == {"uuid": "u-tesla"}
+    assert fetched == ["tesla-inc", "tesla"]
+    with pytest.raises(fetch.CrunchbaseNotFound):
+        companies.details({"id": "tesla-inc", "kind": "organization"})
+
+
+def test_investor_filter_takes_a_name():
+    assert refs.resolve_entity_or_name("Sequoia Capital") == {"id": None, "kind": None, "name": "Sequoia Capital"}
+    assert refs.resolve_entity_or_name("sequoia-capital") == {"id": "sequoia-capital", "kind": None}
+    assert refs.resolve_entity_or_name("https://www.crunchbase.com/person/sam-altman") == {"id": "sam-altman", "kind": "person"}
+    with pytest.raises(ValueError):
+        refs.resolve_entity_or_name("https://www.crunchbase.com/funding_round/x--y")     # a link is never a name
+    data, err = load_query(schemas.FundingRoundSearchSchema, {"investor": "Vocap Partners", "lead_investor": "a16z"})
+    assert err is None and data["investor"]["name"] == "Vocap Partners" and data["lead_investor"]["id"] == "a16z"
+    data, err = load_query(schemas.CompanySearchSchema, {"investor": "Y Combinator"})
+    assert err is None and data["investor"]["name"] == "Y Combinator"
+    assert shared.slug_words("john-smith-7d6e") == "john smith" and shared.slug_words("vocap-partners") == "vocap partners"
+    assert shared.slug_words("1836-ventures") == "1836 ventures"          # a leading number is a word, not a suffix
+    assert shared.slug_words("instinct-9264") == "instinct" and shared.slug_words("nfx") == "nfx"
+
+
+def test_pick_named_matches_whole_words_only():
+    rows = _investor_rows(("VentureSoul Partners", "venturesoul-partners", "organization"),
+                          ("F-Prime Capital", "f-prime-capital", "organization"))
+    assert shared.pick_named(rows, "ventures") is None                    # a partial word is another firm
+    assert shared.pick_named(rows, "f prime")["identifier"]["permalink"] == "f-prime-capital"
+    assert shared.pick_named(rows, "F-Prime Capital", exact_only=True)["identifier"]["permalink"] == "f-prime-capital"
+    assert shared.pick_named(rows, "prime capital") is None               # contains is not begins with
+
+
+def _investor_rows(*rows):
+    return [{"identifier": {"value": name, "permalink": slug, "uuid": f"u-{slug}", "entity_def_id": kind}} for name, slug, kind in rows]
+
+
+def test_investor_name_and_unknown_slug_are_looked_up(monkeypatch):
+    from crunchbase import fetch
+    monkeypatch.setattr(shared, "_investor_names", shared._TTLCache(ttl=60, max_size=10))
+    searched = []
+
+    def typeahead(collection, query):
+        searched.append((collection, query))
+        rows = _investor_rows(("Vocap Partners Fund II", "vocap-fund-ii", "organization"),
+                              ("Vocap Partners", "vocap-ventures", "organization"))
+        return (rows if query.lower().startswith("vocap") else []), 0
+
+    def uuid_of(kind, ref, missing=None):
+        raise fetch.CrunchbaseNotFound("nope")
+
+    monkeypatch.setattr(fetch, "_typeahead", typeahead)
+    monkeypatch.setattr(shared, "uuid_of", uuid_of)
+    # a permalink Crunchbase does not have -> its words, looked up among investors (exact name wins over rank)
+    assert shared.entity_uuid_any({"id": "vocap-partners", "kind": None}) == ("u-vocap-ventures", "organization")
+    assert searched[0] == ("principal.investors", "vocap partners")
+    # a plain name
+    assert shared.entity_uuid_any({"id": None, "kind": None, "name": "Vocap Partners"}) == ("u-vocap-ventures", "organization")
+    # nothing called that -> a clear 404
+    with pytest.raises(fetch.CrunchbaseNotFound, match="no investor named"):
+        shared.entity_uuid_any({"id": None, "kind": None, "name": "zzqx nothing"})
+    with pytest.raises(fetch.CrunchbaseNotFound, match="not a company or person"):
+        shared.entity_uuid_any({"id": "zzqx-nothing", "kind": None})
+
+
+def test_email_is_cleaned():
+    assert parsers.email("support@openrouter.ai.") == "support@openrouter.ai"
+    assert parsers.email(" mailto:hi@stripe.com ") == "hi@stripe.com"
+    assert parsers.email("dpo@stripe.com") == "dpo@stripe.com"
+    assert parsers.email(" . ") is None and parsers.email(None) is None
+    assert parsers.email("MAILTO:hi@stripe.com") == "hi@stripe.com"
+    assert parsers.email("mailto:<hi@stripe.com>.") == "hi@stripe.com"
+
+
+def test_search_rows_take_the_filtered_operating_status(monkeypatch):
+    from crunchbase import discover
+    monkeypatch.setattr(discover, "paged_search", lambda *a, **k: ({"items": [{"id": "x", "operating_status": None}]}, []))
+    assert discover.search_companies(operating_status="closed")["items"][0]["operating_status"] == "closed"
+    assert discover.search_companies()["items"][0]["operating_status"] is None
+
+
 def test_resolve_entity_and_others():
     assert refs.resolve_entity("https://www.crunchbase.com/person/sam-altman") == {"id": "sam-altman", "kind": "person"}
     assert refs.resolve_entity("sequoia-capital")["kind"] is None
@@ -243,3 +404,250 @@ def test_pagination_helpers():
     assert p == {"page": 2, "items_per_page": 15, "total_pages": 7, "total_count": 100}
     assert shared.pagination(3, None, has_items=False)["total_pages"] == 2
     assert shared.pagination(1, 10000, reachable=40)["total_pages"] == 40
+
+
+# ---- cursor memo (page N after pages 1..N-1 = one upstream call) ---------------------
+
+def _rank_search(calls, ranks, field="rank_org_company"):
+    """A search over rows ranked 1..N that honours the cursor predicate."""
+    def search(collection, fields, query, order, limit=15, after_id=None):
+        calls.append(query)
+        rows = [{"uuid": f"u{r}", "properties": {field: r}} for r in ranks]
+        for p in query:
+            if p["field_id"] == field:
+                op, v = p["operator_id"], p["values"][0]
+                keep = {"gt": lambda x: x > v, "gte": lambda x: x >= v, "lt": lambda x: x < v, "lte": lambda x: x <= v}[op]
+                rows = [r for r in rows if keep(r["properties"][field])]
+        return {"count": len(ranks), "entities": rows[:limit]}
+    return search
+
+
+def _page(n, query=()):
+    result, _ = shared.paged_search("organization.companies", ["identifier"], list(query), "rank_org_company",
+                                    "asc", n, lambda r: r)
+    return result
+
+
+def test_cursor_memo_serves_page_n_with_one_call(monkeypatch):
+    shared._cursors.clear()
+    calls = []
+    monkeypatch.setattr(shared.fetch, "search", _rank_search(calls, range(1, 61)))
+    first = _page(1)
+    assert len(calls) == 1 and [r["uuid"] for r in first["items"]] == [f"u{i}" for i in range(1, 16)]
+    second = _page(2)
+    assert len(calls) == 2 and second["items"][0]["uuid"] == "u16" and len(second["items"]) == 15
+    assert second["pagination"] == {"page": 2, "items_per_page": 15, "total_pages": 4, "total_count": 60}
+    third = _page(3)
+    assert len(calls) == 3 and third["items"][0]["uuid"] == "u31"
+    # the walk's end is not memoised past the last full page
+    assert _page(4)["items"][-1]["uuid"] == "u60" and len(calls) == 4
+    assert _page(5)["items"] == [] and len(calls) == 5
+    # a cold page 3 still walks three calls, and re-primes the memo
+    shared._cursors.clear()
+    calls.clear()
+    assert _page(3)["items"][0]["uuid"] == "u31" and len(calls) == 3
+    assert _page(4)["items"][0]["uuid"] == "u46" and len(calls) == 4
+    # page 3 after only page 1: two calls (resume from the deepest memoised hop)
+    shared._cursors.clear()
+    calls.clear()
+    _page(1)
+    assert _page(3)["items"][0]["uuid"] == "u31" and len(calls) == 3
+    # a different query keys apart
+    calls.clear()
+    other = _page(2, [shared.predicate("categories", "includes", ["x"])])
+    assert other["items"][0]["uuid"] == "u16" and len(calls) == 2
+    # expired walks are forgotten
+    calls.clear()
+    monkeypatch.setattr(shared._cursors, "ttl", 0)
+    assert _page(2)["items"][0]["uuid"] == "u16" and len(calls) == 2
+
+
+def test_cursor_memo_carries_the_tie_skip_set(monkeypatch):
+    """Date sorts tie: the inclusive cursor re-serves the boundary rows and
+    the memoised `seen` set has to drop them on the resumed hop."""
+    shared._cursors.clear()
+    calls = []
+    # 40 rows over 4 dates, 10 rows a date, newest first
+    rows = [{"uuid": f"d{i}", "properties": {"announced_on": f"2026-0{4 - i // 10}-01"}} for i in range(40)]
+
+    def search(collection, fields, query, order, limit=15, after_id=None):
+        calls.append(query)
+        out = rows
+        for p in query:
+            if p["field_id"] == "announced_on":
+                v = p["values"][0]
+                out = [r for r in out if (r["properties"]["announced_on"] <= v if p["operator_id"] == "lte"
+                                          else r["properties"]["announced_on"] < v)]
+        return {"count": 40, "entities": out[:limit]}
+
+    monkeypatch.setattr(shared.fetch, "search", search)
+
+    def page(n):
+        result, _ = shared.paged_search("funding_rounds", ["identifier"], [], "announced_on", "desc", n, lambda r: r)
+        return [r["uuid"] for r in result["items"]]
+
+    warm = [page(1), page(2), page(3), page(4)]
+    assert len(calls) == 4                      # one call a page with the memo
+    assert warm[0] == [f"d{i}" for i in range(15)]
+    # the inclusive cursor re-serves the boundary date's rows; dedupe drops
+    # the 5 already served, so a page past the first holds 10 new rows
+    assert warm[1] == [f"d{i}" for i in range(15, 25)]
+    assert warm[2] == [f"d{i}" for i in range(25, 35)]
+    assert warm[3] == [f"d{i}" for i in range(35, 40)]
+    shared._cursors.clear()
+    calls.clear()
+    assert page(3) == warm[2] and len(calls) == 3   # the cold walk agrees
+    assert page(4) == warm[3] and len(calls) == 4
+
+
+def test_card_cursor_memo(monkeypatch):
+    shared._card_cursors.clear()
+    calls = []
+    rows = [{"identifier": {"uuid": f"c{i}"}} for i in range(1, 26)]
+
+    def card(collection, ident, card_id, after_id=None):
+        calls.append(after_id)
+        start = next(i for i, r in enumerate(rows) if r["identifier"]["uuid"] == after_id) + 1 if after_id else 0
+        return rows[start:start + 10]
+
+    monkeypatch.setattr(shared.fetch, "card", card)
+    embedded = rows[:8]                          # the entity embeds a short first page
+    ids = lambda page: [r["identifier"]["uuid"] for r in page]
+    assert ids(shared.card_pages("organizations", "acme", "investors", 2, first_rows=embedded)) == [f"c{i}" for i in range(9, 19)]
+    assert calls == ["c8"]
+    assert ids(shared.card_pages("organizations", "acme", "investors", 3, first_rows=embedded)) == [f"c{i}" for i in range(19, 26)]
+    assert calls == ["c8", "c18"]                # one call, resumed from the memoised after_id
+    assert shared.card_pages("organizations", "acme", "investors", 4, first_rows=embedded) == []
+    assert calls == ["c8", "c18", "c18"]         # the short page 3 ends the walk, as fetch.card_pages would
+    shared._card_cursors.clear()
+    calls.clear()
+    assert ids(shared.card_pages("organizations", "acme", "investors", 3, first_rows=embedded))[0] == "c19"
+    assert calls == ["c8", "c18"]                # cold: N-1 calls
+
+
+# ---- a round's full investor list (the entity embeds only the first 10) --------------
+
+def _investment(i):
+    return {"identifier": {"uuid": f"i{i}", "value": f"Investor {i} investment in Seed Round - Acme",
+                           "permalink": f"investor-{i}-invested-in-acme-seed--i{i}", "entity_def_id": "investment"},
+            "investor_identifier": {"uuid": f"v{i}", "value": f"Investor {i}", "permalink": f"investor-{i}",
+                                    "entity_def_id": "organization"}}
+
+
+def _cards_endpoint(calls, rows):
+    def card(collection, ident, card_id, after_id=None):
+        calls.append((collection, card_id, after_id))
+        start = next(i for i, r in enumerate(rows) if r["identifier"]["uuid"] == after_id) + 1 if after_id else 0
+        return rows[start:start + 10]
+    return card
+
+
+def _round_entity(rows, total):
+    return {"properties": {"identifier": {"uuid": "r-uuid", "value": "Seed Round - Acme",
+                                          "permalink": "acme-seed--5ab76566", "entity_def_id": "funding_round"}},
+            "cards": {"investors_headline": {"num_investors": total}, "investors_list": rows[:10],
+                      "overview_fields_v2": {"investment_type": "seed"}}}
+
+
+def test_round_details_walks_every_investor(monkeypatch):
+    from crunchbase import deals
+    rows = [_investment(i) for i in range(1, 17)]            # a 16-investor seed round
+    calls = []
+    monkeypatch.setattr(shared.fetch, "card", _cards_endpoint(calls, rows))
+    monkeypatch.setattr(deals.fetch, "entity", lambda *a, **k: _round_entity(rows, 16))
+    monkeypatch.setattr(deals, "_one", lambda *a, **k: None)
+    fr = deals.funding_round_details({"id": "acme-seed--5ab76566"})
+    assert fr["investors_count"] == 16
+    assert [i["investor"]["id"] for i in fr["investments"]] == [f"investor-{i}" for i in range(1, 17)]
+    assert [r["id"] for r in fr["investors"]] == [f"investor-{i}" for i in range(1, 17)]
+    assert calls == [("funding_rounds", "investors_list", "i10")]   # one cards call, after the 10th
+
+
+def test_round_details_skip_the_walk_when_complete(monkeypatch):
+    from crunchbase import deals
+    rows = [_investment(i) for i in range(1, 11)]            # exactly 10: no extra call
+    calls = []
+    monkeypatch.setattr(shared.fetch, "card", _cards_endpoint(calls, rows))
+    monkeypatch.setattr(deals.fetch, "entity", lambda *a, **k: _round_entity(rows, 10))
+    monkeypatch.setattr(deals, "_one", lambda *a, **k: None)
+    assert len(deals.funding_round_details({"id": "acme-seed--5ab76566"})["investments"]) == 10 and calls == []
+
+
+def test_round_details_keep_the_first_page_when_refused(monkeypatch):
+    from crunchbase import deals
+
+    def refused(*a, **k):
+        raise deals.fetch.CrunchbaseBadRequest("insufficient permissions (investors_list)")
+
+    rows = [_investment(i) for i in range(1, 17)]
+    monkeypatch.setattr(shared.fetch, "card", refused)
+    monkeypatch.setattr(deals.fetch, "entity", lambda *a, **k: _round_entity(rows, 16))
+    monkeypatch.setattr(deals, "_one", lambda *a, **k: None)
+    fr = deals.funding_round_details({"id": "acme-seed--5ab76566"})
+    assert len(fr["investments"]) == 10 and fr["investors_count"] == 16
+
+    def blocked(*a, **k):
+        raise deals.fetch.CrunchbaseBlocked("challenged")
+
+    monkeypatch.setattr(shared.fetch, "card", blocked)
+    with pytest.raises(deals.fetch.CrunchbaseBlocked):       # never a silent short list
+        deals.funding_round_details({"id": "acme-seed--5ab76566"})
+
+
+def test_card_all_stops(monkeypatch):
+    rows = [_investment(i) for i in range(1, 46)]
+    calls = []
+    monkeypatch.setattr(shared.fetch, "card", _cards_endpoint(calls, rows))
+    ids = lambda got: [r["identifier"]["uuid"] for r in got]
+    # the headline count bounds the walk
+    assert ids(shared.card_all("funding_rounds", "r", "investors_list", rows[:10], 25, 300)) == [f"i{i}" for i in range(1, 31)]
+    assert [c[2] for c in calls] == ["i10", "i20"]
+    # max_rows caps it
+    calls.clear()
+    assert len(shared.card_all("funding_rounds", "r", "investors_list", rows[:10], 45, 20)) == 20 and len(calls) == 1
+    # a short cards page ends it even when the headline promised more
+    calls.clear()
+    assert len(shared.card_all("funding_rounds", "r", "investors_list", rows[:10], 99, 300)) == 45
+    assert [c[2] for c in calls] == ["i10", "i20", "i30", "i40"]
+    # a cards page of rows already held (after_id ignored) ends it
+    calls.clear()
+    monkeypatch.setattr(shared.fetch, "card", lambda *a, **k: calls.append(1) or rows[:10])
+    assert len(shared.card_all("funding_rounds", "r", "investors_list", rows[:10], 16, 300)) == 10 and calls == [1]
+    # no embedded page: the walk starts from the first cards page
+    calls.clear()
+    monkeypatch.setattr(shared.fetch, "card", _cards_endpoint(calls, rows[:16]))
+    assert len(shared.card_all("funding_rounds", "r", "investors_list", [], 16, 300)) == 16
+    assert [c[2] for c in calls] == [None, "i10"]
+
+
+def test_round_lead_flags():
+    rows = [_investment(i) for i in range(1, 17)]
+    flags = lambda fr: {i["investor"]["id"]: i["is_lead_investor"] for i in fr["investments"]}
+    lead_refs = parsers.refs_list([rows[2]["investor_identifier"], rows[11]["investor_identifier"]])
+    # the search row's lead list is complete: listed = lead, everyone else = not
+    fr = parsers.funding_round(_round_entity(rows, 16), {"lead_investors": lead_refs}, investments=rows)
+    assert [k for k, v in flags(fr).items() if v] == ["investor-3", "investor-12"]
+    assert sum(v is False for v in flags(fr).values()) == 14
+    # a search row with no leads and no lead card: a round without leads
+    assert set(flags(parsers.funding_round(_round_entity(rows, 16), {"lead_investors": []}, investments=rows)).values()) == {False}
+    # no search row: the lead card names who led, the rest stay unknown
+    entity = _round_entity(rows, 16)
+    entity["cards"]["lead_investors_image_list"] = [{"identifier": rows[1]["investor_identifier"]}]
+    fr = parsers.funding_round(entity, None, investments=rows)
+    assert flags(fr)["investor-2"] is True and sum(v is None for v in flags(fr).values()) == 15
+    assert [r["id"] for r in fr["lead_investors"]] == ["investor-2"]
+    # nothing known about leads: all null
+    assert set(flags(parsers.funding_round(_round_entity(rows, 16), None, investments=rows)).values()) == {None}
+    # the captured round: its one investor is its lead
+    assert parsers.funding_round(fx("funding_round"))["investments"][0]["is_lead_investor"] is True
+
+
+def test_round_investors_count_from_the_gated_list_length():
+    row = fx("search_funding_rounds")["entities"][0]
+    assert row["properties"]["num_relationships"] == 134                  # not an investor count
+    assert parsers.funding_round_row(row)["investors_count"] == row["preview_properties"]["investor_identifiers"]["length"] == 32
+    card_row = {"identifier": {"uuid": "u", "value": "Seed Round - Acme", "permalink": "acme-seed--1", "entity_def_id": "funding_round"},
+                "preview_properties": {"investor_identifiers": {"is_present": True, "length": 16}}}
+    assert parsers.funding_round_row({"properties": card_row})["investors_count"] == 16
+    assert parsers.funding_round_row({"properties": {"investor_identifiers": [{"uuid": "a", "value": "A"}]}})["investors_count"] == 1
+    assert parsers.funding_round_row({"properties": {"identifier": card_row["identifier"]}})["investors_count"] is None

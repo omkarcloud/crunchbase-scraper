@@ -73,7 +73,7 @@ def investments(person, page=1):
     data = _entity(person)
     cards = data.get("cards") or {}
     first = cards.get("investments_list") or []
-    rows = first if page == 1 else fetch.card_pages("people", person["id"], "investments_list", page, first_rows=first)
+    rows = first if page == 1 else shared.card_pages("people", person["id"], "investments_list", page, first_rows=first)
     inv = cards.get("investor_overview_headline") or {}
     return {
         "person": parsers.ref((data.get("properties") or {}).get("identifier")),

@@ -111,6 +111,18 @@ def date_precision(item):
     return item.get("precision") if isinstance(item, dict) else None
 
 
+def email(value):
+    """A contact email as Crunchbase stores it, minus what a sentence left on
+    it ("support@openrouter.ai." -> "support@openrouter.ai")."""
+    if not isinstance(value, str):
+        return None
+    edge = ".,;:<>()[]\"' \t\r\n"
+    value = value.strip(edge)
+    if value[:7].lower() == "mailto:":          # any case; what it wrapped is trimmed again ("mailto:<a@b.c>")
+        value = value[7:].strip(edge)
+    return value or None
+
+
 def link_value(item):
     if isinstance(item, dict):
         return item.get("value") or None
@@ -258,7 +270,7 @@ def organization(data, extra=None):
         "short_description": _get(cards, "about_short_description", "short_description") or props.get("short_description"),
         "description": _get(cards, "overview_description", "description"),
         "website": link_value(about.get("website")) or extra.get("website"),
-        "email": _get(cards, "contact_fields", "contact_email"),
+        "email": email(_get(cards, "contact_fields", "contact_email")),
         "phone": _get(cards, "contact_fields", "phone_number"),
         "social": _social(cards.get("social_fields")),
         "founded_on": extra.get("founded_on"),
@@ -762,6 +774,20 @@ def investor_row(row):
 
 # ---- deals -------------------------------------------------------------------------
 
+def _investors_count(row, p):
+    """A round's investor count. `num_investors` is not selectable
+    anonymously and `investor_identifiers` comes back as a preview
+    placeholder, but that placeholder still carries the list's `length`
+    ({is_present: true, length: 16} for a 16-investor round). Search rows
+    keep preview_properties beside properties, card rows inside them."""
+    if p.get("num_investors") is not None:
+        return p["num_investors"]
+    if p.get("investor_identifiers"):
+        return len(p["investor_identifiers"])
+    preview = row.get("preview_properties") or p.get("preview_properties") or {}
+    return _get(preview, "investor_identifiers", "length")
+
+
 def funding_round_row(row):
     p = row.get("properties") or row
     ident = ref(p.get("identifier"), with_image=False)
@@ -779,7 +805,7 @@ def funding_round_row(row):
         "pre_money_valuation": money(p.get("pre_money_valuation")),
         "post_money_valuation": money(p.get("post_money_valuation")),
         "is_equity": p.get("is_equity"),
-        "investors_count": p.get("num_investors") if p.get("num_investors") is not None else (p.get("num_relationships")),
+        "investors_count": _investors_count(row, p),
         "lead_investors": refs_list(p.get("lead_investor_identifiers")),
         "investors": refs_list(p.get("investor_identifiers")),
         "company_funding_total": money(p.get("funded_organization_funding_total")),
@@ -789,8 +815,10 @@ def funding_round_row(row):
     }
 
 
-def funding_round(data, extra=None):
-    """funding_round entity (layout funding_round) + its search row."""
+def funding_round(data, extra=None, investments=None):
+    """funding_round entity (layout funding_round) + its search row.
+    `investments` = every investors_list row (the entity embeds only the
+    first 10; deals._round_investments walks the rest)."""
     props = data.get("properties") or {}
     cards = data.get("cards") or {}
     out = funding_round_row({"properties": {**props, **(cards.get("overview_fields_v2") or {})}})
@@ -798,8 +826,26 @@ def funding_round(data, extra=None):
         for k, v in extra.items():
             if out.get(k) in (None, [], {}) and v not in (None, [], {}):
                 out[k] = v
-    out["investments"] = [investment_row(i) for i in cards.get("investors_list") or []]
-    out["lead_investors"] = out["lead_investors"] or refs_list(cards.get("lead_investors_image_list"))
+    rows = investments if investments is not None else cards.get("investors_list") or []
+    out["investments"] = [x for x in (investment_row(i) for i in rows) if x]
+    # investor_identifiers is gated in the search row: list them from the investments
+    out["investors"] = out["investors"] or refs_list([i.get("investor_identifier") for i in rows if isinstance(i, dict)])
+    card_leads = refs_list(cards.get("lead_investors_image_list"))
+    out["lead_investors"] = out["lead_investors"] or card_leads
+    # The round's investors_list rows carry no is_lead_investor: flag them
+    # from the lead list. The search row lists a round's leads in the clear
+    # and in full (all 10 of a 10-lead round), so with it in hand an investor
+    # missing from the list is not a lead; without it, only the listed leads
+    # are known and everyone else stays null.
+    search_leads = (extra or {}).get("lead_investors") or []
+    complete = extra is not None and (bool(search_leads) or not card_leads)
+    lead_ids = {r.get("uuid") for r in out["lead_investors"] if r.get("uuid")}
+    for inv in out["investments"]:
+        if inv.get("is_lead_investor") is None and inv.get("investor"):
+            if inv["investor"].get("uuid") in lead_ids:
+                inv["is_lead_investor"] = True
+            elif complete:
+                inv["is_lead_investor"] = False
     out["investors_count"] = _get(cards, "investors_headline", "num_investors") or out["investors_count"]
     out["press"] = [timeline_row(e) for e in _get(cards, "timeline", "entities") or []]
     out["articles_count"] = _get(cards, "timeline", "count")

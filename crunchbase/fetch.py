@@ -486,10 +486,18 @@ def _candidate_exits():
 
 
 def _curl_validates(cookies, ua, proxy):
+    """Does this identity's exit answer the API over curl? Probed with the
+    call the identity is minted for, a one-row company search. Until
+    2026-11-12 the probe was an autocomplete GET, which Cloudflare now
+    challenges for every curl client whatever the cookie (see autocomplete):
+    every mint failed it, every identity fell into browser mode, and the
+    in-page searches there were refused more often than not."""
+    body = json.dumps({"field_ids": ["identifier"], "order": [], "query": [], "field_aggregators": [],
+                       "collection_id": "organization.companies", "limit": 1})
     sess = _new_session(proxy)
     try:
-        resp = sess.get(f"{SITE}/v4/data/autocompletes?query=stripe&collection_ids=organizations&limit=1",
-                        headers=_headers(ua, "json"), cookies=cookies, timeout=TIMEOUT)
+        resp = sess.post(f"{SITE}/v4/data/searches/organization.companies?source=collection_advanced_search",
+                         headers=_headers(ua, "post"), cookies=cookies, data=body, timeout=TIMEOUT)
     except Exception as e:
         print(f"crunchbase: curl validation failed: {type(e).__name__}: {e}")
         return False
@@ -695,10 +703,99 @@ def _q(value):
     return quote(json.dumps(value, separators=(",", ":")), safe="")
 
 
+# Typeahead over the search endpoint: the rank each collection sorts on
+# (best first). Collections not listed have no rank and sort by name, which
+# puts the rows named exactly like the query first.
+_TYPEAHEAD_RANK = {
+    "organizations": "rank_org",
+    "organization.companies": "rank_org_company",
+    "principal.investors": "rank_principal_investor",
+    "organization.schools": "rank_org_school",
+    "people": "rank_person",
+    "funding_rounds": "rank_funding_round",
+    "acquisitions": "rank_acquisition",
+    "ipos": "rank_ipo",
+    "events": "rank_event",
+    "hubs": "rank_hub",
+}
+# Collections whose search selects nothing but the identifier.
+_TYPEAHEAD_BARE = ("categories", "category_groups", "products")
+
+
+def _typeahead(collection, query):
+    """Rows of one collection whose name matches `query` -> (rows in the
+    autocomplete shape, match count). Two searches side by side: `starts`
+    matches a prefix of the whole name ("fin" -> FinTech), `contains` a
+    whole word anywhere in it ("altman" -> Sam Altman). A ranked collection
+    comes back best rank first; an unranked one exact names first, then
+    prefixes, then the rest. A location query may carry qualifiers after
+    commas ("San Francisco, California"): each one must appear in the
+    location's description ("San Francisco, California, United States,
+    North America")."""
+    rank = _TYPEAHEAD_RANK.get(collection)
+    fields = ["identifier"] if collection in _TYPEAHEAD_BARE else ["identifier", "short_description", "facet_ids"]
+    if rank:
+        fields.append(rank)
+    order = [{"field_id": rank or "identifier", "sort": "asc"}]
+    name, extra = query.strip(), []
+    if collection.startswith("location"):
+        name, *qualifiers = [part.strip() for part in query.split(",")]
+        extra = [predicate("short_description", "contains", [q]) for q in qualifiers if q]
+    if not name:
+        return [], 0
+    pages = run_parallel([lambda op=op: search(collection, fields, [predicate("identifier", op, [name])] + extra, order)
+                          for op in ("starts", "contains")])
+    rows, seen = [], set()
+    for data in pages:
+        for row in data.get("entities") or []:
+            props = row.get("properties") or {}
+            ident = props.get("identifier")
+            if not isinstance(ident, dict):
+                continue
+            uuid = row.get("uuid") or ident.get("uuid")
+            if uuid:                         # a row without a uuid is never a duplicate of another
+                if uuid in seen:
+                    continue
+                seen.add(uuid)
+            rows.append(props)
+    low = name.lower()
+
+    def position(indexed):
+        index, props = indexed
+        if rank:
+            value = props.get(rank)
+            return value if isinstance(value, (int, float)) else float("inf"), index
+        value = (props["identifier"].get("value") or "").lower()
+        return 0 if value == low else 1 if value.startswith(low) else 2, index
+    return ([props for _i, props in sorted(enumerate(rows), key=position)],
+            max(data.get("count") or 0 for data in pages))
+
+
 def autocomplete(query, collection_ids, limit=10):
-    url = (f"{SITE}/v4/data/autocompletes?query={quote(query)}&collection_ids={quote(collection_ids)}"
-           f"&limit={int(limit)}&source=topSearch")
-    return request("GET", url, label=f"autocomplete {query!r}")
+    """Typeahead: rows of `collection_ids` (comma-separated) whose name
+    matches `query` -> {count, entities: [{identifier, short_description,
+    facet_ids}]}, the shape of GET /v4/data/autocompletes.
+
+    That endpoint is no longer usable (2026-11-12): Cloudflare answers it
+    with a managed challenge to every curl client, with or without a minted
+    cf_clearance and whatever the TLS profile, and to an in-page fetch from
+    any browser that was not itself challenged first (box probes: 0 of 10 on
+    Ubuntu, 2 of 10 on Windows), while the searches and the entity endpoint
+    answer plain curl. So the rows come from the search endpoint, two
+    searches per collection (_typeahead), several collections interleaved.
+    What it costs: no relevance score (rank order instead; locations,
+    categories, funds and products have no rank and come back by name), and
+    15 rows per search at most (the anonymous cap), so a name shared by more
+    places than that needs a qualifier to surface the one meant."""
+    collections = [c.strip() for c in collection_ids.split(",") if c.strip()]
+    results = run_parallel([lambda c=c: _typeahead(c, query) for c in collections])
+    queues = [list(rows) for rows, _total in results]
+    merged = []
+    while any(queues):                     # round robin, so no collection crowds the others out
+        for queue in queues:
+            if queue:
+                merged.append(queue.pop(0))
+    return {"count": sum(total for _rows, total in results), "entities": merged[:int(limit)]}
 
 
 def entity(collection, ident, field_ids, card_ids=None, layout=None, missing=None):

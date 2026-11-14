@@ -11,6 +11,9 @@ IPO_FIELDS = ["identifier", "short_description", "went_public_on", "delisted_on"
               "stock_exchange_symbol", "stock_symbol", "valuation", "share_price", "rank_ipo"]
 FUND_FIELDS = ["identifier", "short_description", "announced_on", "money_raised", "owner_identifier",
                "investor_identifiers", "num_investors"]
+# Deepest a round's investor list is walked: the entity embeds the first
+# fetch.CARD_PAGE (10) investments, each further cards call adds 10.
+ROUND_INVESTORS_MAX = 300
 
 
 def _one(collection, fields, uuid, parser):
@@ -57,7 +60,25 @@ def funding_round_details(funding_round):
     data = fetch.entity("funding_rounds", ident, ["identifier", "short_description"], layout="funding_round",
                         missing=f"funding round '{ident}' not found on Crunchbase")
     uuid = ((data.get("properties") or {}).get("identifier") or {}).get("uuid")
-    return parsers.funding_round(data, _one("funding_rounds", ROUND_FIELDS, uuid, parsers.funding_round_row) if uuid else None)
+    return parsers.funding_round(data, _one("funding_rounds", ROUND_FIELDS, uuid, parsers.funding_round_row) if uuid else None,
+                                 investments=_round_investments(uuid or ident, data))
+
+
+def _round_investments(ident, data):
+    """Every investment of the round. The entity's investors_list card holds
+    only the first 10 (a 16-investor seed round came back with 10); the rest
+    page through the cards endpoint, which funding rounds serve outside the
+    organization cookie quota. A rejected cards call (MD403 / MD101) falls
+    back to the embedded first page; a block or upstream failure raises, so
+    a transient short list is never served (or cached) as the whole round."""
+    cards = data.get("cards") or {}
+    first = cards.get("investors_list") or []
+    total = parsers._get(cards, "investors_headline", "num_investors")
+    try:
+        return shared.card_all("funding_rounds", ident, "investors_list", first, total, ROUND_INVESTORS_MAX)
+    except fetch.CrunchbaseBadRequest as e:
+        print(f"crunchbase: round {ident} investors past the first page refused ({e}); serving {len(first)} of {total}")
+        return first
 
 
 # ---- acquisitions ----------------------------------------------------------------------

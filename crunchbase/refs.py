@@ -21,6 +21,7 @@ Crunchbase data model uses (`c_00011_00050` for 11-50 employees, …) and
 back, so responses read as the public values.
 """
 import re
+import unicodedata
 from urllib.parse import unquote, urlparse
 
 SITE = "https://www.crunchbase.com"
@@ -108,6 +109,46 @@ def resolve_ref(value, kinds, what):
 
 def resolve_company(value):
     return resolve_ref(value, ("organization",), "company")
+
+
+def resolve_entity_or_name(value):
+    """resolve_entity, plus a plain company or person name ("Sequoia Capital",
+    "Sam Altman"): {"id": None, "kind": None, "name": <name>}, looked up by
+    shared.entity_uuid_any. A link is never read as a name."""
+    try:
+        return resolve_entity(value)
+    except ValueError:
+        name = " ".join((value or "").split())
+        if not name or _parse_link(name)[0] is not None:
+            raise
+        return {"id": None, "kind": None, "name": name}
+
+
+def resolve_company_or_name(value):
+    """resolve_company, plus a plain company name ("Open AI", "Stripe, Inc."):
+    {"id": None, "kind": "organization", "name": <name>}. The endpoint looks
+    the name up (companies.details). A link is never read as a name."""
+    try:
+        return resolve_company(value)
+    except ValueError:
+        name = " ".join((value or "").split())
+        # punctuation alone ("!!!") names nothing: no row could ever match it
+        if not name_key(name) or _parse_link(name)[0] is not None:
+            raise
+        return {"id": None, "kind": "organization", "name": name}
+
+
+def name_key(value):
+    """A company name reduced to what two spellings of it share: lowercase
+    letters and digits ("Open AI", "OpenAI" and "open-ai" are one key), in
+    any script, accents folded ("Nestlé" and "Nestle" are one key). An
+    ASCII-only key would be empty for "Яндекс" and make "Škoda" and "Koda"
+    the same company."""
+    text = unicodedata.normalize("NFKD", value or "").casefold()
+    # U+0300-U+036F: the accents NFKD splits off a Latin / Greek / Cyrillic
+    # letter. Every other mark (an Indic vowel sign, …) is part of the word.
+    return "".join(ch for ch in text
+                   if ch.isalnum() or (unicodedata.category(ch)[0] == "M" and not "̀" <= ch <= "ͯ"))
 
 
 def resolve_person(value):

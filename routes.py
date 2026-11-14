@@ -97,7 +97,7 @@ P = True   # paginated (page)
 
 # (public path, request schema, endpoint function, paginated) — the order of the docs.
 ENDPOINTS = [
-    ("/companies/details", schemas.CompanySchema, companies.details, False),
+    ("/companies/details", schemas.CompanyDetailsSchema, companies.details, False),
     ("/companies/funding", schemas.CompanyFundingSchema, companies.funding, P),
     ("/companies/investors", schemas.CompanyPagedSchema, companies.investors, P),
     ("/companies/people", schemas.CompanyPeopleSchema, companies.people, P),
