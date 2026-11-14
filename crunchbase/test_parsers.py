@@ -192,6 +192,26 @@ def test_investor_name_and_unknown_slug_are_looked_up(monkeypatch):
         shared.entity_uuid_any({"id": "zzqx-nothing", "kind": None})
 
 
+def test_round_search_company_filter_takes_a_name_and_retries_a_missing_permalink(monkeypatch):
+    from crunchbase import companies, deals, fetch
+    data, err = load_query(schemas.FundingRoundSearchSchema, {"company": "Open AI"})
+    assert err is None and data["company"] == {"id": None, "kind": "organization", "name": "Open AI"}
+
+    def uuid_of(kind, ref, missing=None):
+        if ref["id"] == "tesla":
+            raise fetch.CrunchbaseNotFound("nope")
+        return f"u-{ref['id']}"
+
+    named = {"Open AI": "openai", "tesla": "tesla-motors"}
+    monkeypatch.setattr(shared, "uuid_of", uuid_of)
+    monkeypatch.setattr(companies, "_named", lambda name: {"id": named[name], "kind": "organization"})
+    assert deals._company_uuid({"id": None, "kind": "organization", "name": "Open AI"}) == "u-openai"
+    assert deals._company_uuid({"id": "stripe", "kind": None}) == "u-stripe"
+    assert deals._company_uuid({"id": "tesla", "kind": None}) == "u-tesla-motors"       # no such permalink -> its name
+    with pytest.raises(fetch.CrunchbaseNotFound):
+        deals._company_uuid({"id": "tesla", "kind": "organization"})                    # a link is final
+
+
 def test_email_is_cleaned():
     assert parsers.email("support@openrouter.ai.") == "support@openrouter.ai"
     assert parsers.email(" mailto:hi@stripe.com ") == "hi@stripe.com"
@@ -339,6 +359,33 @@ def test_person_entity():
     assert p["current_jobs"][0]["company"]["name"] == "OpenAI" and p["current_jobs"][0]["started_on"]
     assert p["past_jobs"] and p["board_and_advisor_roles"][0]["ended_on"]
     assert p["social"]["twitter"] and p["website"]
+
+
+def test_organization_rank_and_aliases_fall_back_to_the_entity_fields():
+    """An investment firm has no row in the companies search: its rank comes from the entity."""
+    data = {"properties": {"identifier": {"uuid": "u", "value": "Sequoia Capital", "permalink": "sequoia-capital",
+                                          "entity_def_id": "organization"},
+                           "rank_org": 10, "aliases": ["Sequoia"]}, "cards": {}}
+    org = parsers.organization(data, {})
+    assert org["rank"]["overall"] == 10 and org["rank"]["company"] is None and org["aliases"] == ["Sequoia"]
+    org = parsers.organization(data, {"rank": 3, "rank_company": 2, "aliases": ["SC"]})      # the search row wins
+    assert org["rank"]["overall"] == 3 and org["rank"]["company"] == 2 and org["aliases"] == ["SC"]
+
+
+def test_person_name_parts_and_birth_date_come_from_the_entity_fields():
+    data = fx("person_sam_altman")
+    data = {**data, "properties": {**data["properties"], "first_name": "Sam", "last_name": "Altman", "born_on": "1985-04-22"}}
+    p = parsers.person(data, {})
+    assert (p["first_name"], p["last_name"], p["born_on"]) == ("Sam", "Altman", "1985-04-22")
+
+
+def test_round_equity_flag_and_investor_count_come_from_the_entity_fields():
+    data = {"properties": {"identifier": {"uuid": "u1", "value": "Series G - Anthropic", "permalink": "anthropic-series-g--d95127fa",
+                                          "entity_def_id": "funding_round"},
+                           "is_equity": True, "num_investors": 46},
+            "cards": {}}
+    r = parsers.funding_round(data, {"is_equity": None, "investors_count": None})
+    assert r["is_equity"] is True and r["investors_count"] == 46
 
 
 # ---- search rows ------------------------------------------------------------------------

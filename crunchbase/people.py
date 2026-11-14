@@ -8,6 +8,9 @@ from crunchbase.discover import PERSON_FIELDS
 from crunchbase.shared import add, paged_search
 
 _entities = shared._TTLCache(ttl=6 * 3600, max_size=400)
+# The person entity hands these out anonymously, but only when asked for by
+# name: the `person` layout's cards carry no first / last name or birth date.
+ENTITY_FIELDS = ["identifier", "short_description", "facet_ids", "first_name", "last_name", "born_on", "gender"]
 
 
 def _entity(person):
@@ -15,7 +18,7 @@ def _entity(person):
     hit = _entities.get(ident)
     if hit:
         return hit
-    data = fetch.entity("people", ident, ["identifier", "short_description", "facet_ids"], layout="person",
+    data = fetch.entity("people", ident, ENTITY_FIELDS, layout="person",
                         missing=f"person '{ident}' not found on Crunchbase")
     uuid = ((data.get("properties") or {}).get("identifier") or {}).get("uuid")
     if uuid:

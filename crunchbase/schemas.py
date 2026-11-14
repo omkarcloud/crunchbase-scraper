@@ -133,6 +133,14 @@ class OptionalCompanyField(CompanyField):
         super().__init__(**kwargs)
 
 
+class OptionalCompanyOrNameField(CompanyOrNameField):
+    """A company filter that also takes the company's plain name ("Open AI")."""
+    def __init__(self, **kwargs):
+        kwargs.setdefault("required", False)
+        kwargs.setdefault("load_default", None)
+        super().__init__(**kwargs)
+
+
 class OptionalPersonField(PersonField):
     def __init__(self, **kwargs):
         kwargs.setdefault("required", False)
@@ -349,7 +357,7 @@ class PersonEventsSchema(PersonSchema):
 # ---- deals -------------------------------------------------------------------------------
 
 class FundingRoundSearchSchema(BaseSchema):
-    company = OptionalCompanyField()
+    company = OptionalCompanyOrNameField()
     investor = OptionalInvestorField()
     lead_investor = OptionalInvestorField()
     category = NameOrSlugField()

@@ -1,7 +1,7 @@
 """/crunchbase/funding-rounds, acquisitions, investments, ipos, funds:
 the deal collections (searches, cursor-walked) and their entity pages.
 None of these touch the organization cookie quota."""
-from crunchbase import fetch, parsers, refs, shared
+from crunchbase import companies, fetch, parsers, refs, shared
 from crunchbase.companies import ACQUISITION_FIELDS, ROUND_FIELDS
 from crunchbase.shared import add, date_range, money_range, paged_search
 
@@ -14,6 +14,10 @@ FUND_FIELDS = ["identifier", "short_description", "announced_on", "money_raised"
 # Deepest a round's investor list is walked: the entity embeds the first
 # fetch.CARD_PAGE (10) investments, each further cards call adds 10.
 ROUND_INVESTORS_MAX = 300
+# A round's equity flag and investor count are locked in the anonymous search
+# but open on the entity when asked for by name. (Its dates, amounts and
+# valuations stay locked there too: `preview_properties: {is_present: true}`.)
+ROUND_ENTITY_FIELDS = ["identifier", "short_description", "is_equity", "num_investors"]
 
 
 def _one(collection, fields, uuid, parser):
@@ -27,13 +31,31 @@ def _one(collection, fields, uuid, parser):
 
 # ---- funding rounds --------------------------------------------------------------------
 
+def _company_uuid(company):
+    """uuid of the `company` filter: a permalink / uuid / link ref, or a name
+    ({"id": None, "name": …}, looked up like /companies/details does). A bare
+    word that is no permalink ("tesla": the permalink is tesla-motors) is
+    retried as a name before it is reported missing."""
+    if company.get("id") is None:
+        company = companies._named(company["name"])
+    try:
+        return shared.uuid_of("organization", company)
+    except fetch.CrunchbaseNotFound:
+        if company.get("kind") or refs.is_uuid(company["id"]):     # a link, a uuid or a looked-up name: final
+            raise
+        named = companies._named(shared.slug_words(company["id"]) or company["id"])
+        if named["id"] == company["id"]:
+            raise
+        return shared.uuid_of("organization", named)
+
+
 def search_funding_rounds(company=None, investor=None, lead_investor=None, category=None, location=None,
                           round_type=None, funding_stage=None, announced_after=None, announced_before=None,
                           min_amount=None, max_amount=None, min_investors=None, equity_only=None,
                           sort="announced", page=1):
     q = []
     if company:
-        add(q, "funded_organization_identifier", "includes", [shared.uuid_of("organization", company)])
+        add(q, "funded_organization_identifier", "includes", [_company_uuid(company)])
     if investor:
         add(q, "investor_identifiers", "includes", [shared.entity_uuid_any(investor)[0]])
     if lead_investor:
@@ -57,7 +79,7 @@ def search_funding_rounds(company=None, investor=None, lead_investor=None, categ
 
 def funding_round_details(funding_round):
     ident = funding_round["id"]
-    data = fetch.entity("funding_rounds", ident, ["identifier", "short_description"], layout="funding_round",
+    data = fetch.entity("funding_rounds", ident, ROUND_ENTITY_FIELDS, layout="funding_round",
                         missing=f"funding round '{ident}' not found on Crunchbase")
     uuid = ((data.get("properties") or {}).get("identifier") or {}).get("uuid")
     return parsers.funding_round(data, _one("funding_rounds", ROUND_FIELDS, uuid, parsers.funding_round_row) if uuid else None,

@@ -43,13 +43,20 @@ APPEARANCE_FIELDS = ["identifier", "short_description", "event_identifier", "eve
                      "participant_identifier", "appearance_type"]
 
 
+# Asked from the entity by name. The ranks and aliases normally come with the
+# company's row in the companies search (_row), but an organization that is
+# not in that collection (an investment firm: Sequoia Capital) has no row
+# there, and the entity hands them out all the same.
+ENTITY_FIELDS = ["identifier", "short_description", "rank_delta_d90", "category_groups", "rank_org", "rank_org_company", "aliases"]
+
+
 def _entity(company):
     """The full organization entity (cached) + its uuid."""
     ident = company["id"]
     hit = _entities.get(ident)
     if hit:
         return hit
-    data = fetch.entity("organizations", ident, ["identifier", "short_description", "rank_delta_d90", "category_groups"],
+    data = fetch.entity("organizations", ident, ENTITY_FIELDS,
                         layout="organization", missing=f"company '{ident}' not found on Crunchbase")
     uuid = ((data.get("properties") or {}).get("identifier") or {}).get("uuid")
     if uuid:
