@@ -5,6 +5,8 @@ www.crunchbase.com is an Angular app whose every page is server-rendered
 from ONE internal JSON API, and that API is what this module talks to:
 
   GET  /v4/data/autocompletes?query=&collection_ids=&limit=
+       (NOT called since 2026-11-12: challenged for every curl client; the
+       typeahead is served by the searches instead, see autocomplete())
   GET  /v4/data/entities/<collection>/<slug|uuid>?field_ids=[..]&card_ids=[..]
        &layout_id=<entity>&layout_mode=view_v3      (all cards of the layout)
   GET  /v4/data/entities/<collection>/<id>/cards/<card>?card_id=<card>&after_id=<uuid>
@@ -14,9 +16,11 @@ from ONE internal JSON API, and that API is what this module talks to:
 
 Cloudflare fronts everything:
   * every path answers a managed challenge (403 + cf-mitigated: challenge)
-    to plain curl on every egress; a HEADED patchright Chrome clears it in
-    2-8 s on direct egress (no click) and after a Turnstile click or two on
-    residential exits; headless never clears ("Attention Required").
+    to plain curl on every egress; a HEADED Chrome clears it in 2-8 s on
+    direct egress (no click) and after a Turnstile click or two on
+    residential exits; headless never clears ("Attention Required"). Since
+    2026-10-22 that Chrome runs on the browser box (browser_client.mint ->
+    recipes/crunchbase.py), through the same exit this pod replays on.
   * the browser's cf_clearance + __cf_bm and its user-agent replay over
     curl_cffi from the same exit, for GET pages, GET /v4/data JSON and the
     POST searches — the POSTs only with the FULL Chrome header set (sec-ch-ua,
@@ -36,6 +40,12 @@ Cloudflare fronts everything:
     another exit (a fresh residential exit is minted when none is ready).
   * a cookie dies in under two hours; identities are retired at
     config.CRUNCHBASE_IDENTITY_TTL.
+  * 2026-11-12: the rules differ per path now. The searches and the entity
+    endpoint (cards included) answer curl on a clean exit even without a
+    cookie; HTML pages and /v4/data/autocompletes answer a managed challenge
+    to curl WITH a fresh cf_clearance (four curl_cffi Chrome profiles, the
+    browser's own client hints). An identity is therefore validated on a
+    search (_curl_validates), never on a path of the second kind.
 
 Anonymous entitlement (what a logged-out visitor may read): searches return
 at most 15 rows and refuse after_id paging and aggregations; the values
@@ -47,13 +57,18 @@ permalinks, categories, locations, ranks, growth / heat scores, round
 types, investor / people / acquisition relationships, signals, tech stack,
 predictions, press titles) is in the clear.
 
-Identities are minted by ONE shared headed Chrome (launched on demand,
-closed after config.CRUNCHBASE_BROWSER_IDLE seconds idle): clear the
-browser's cookies, load the seed page (the discover page — never an
-organization page, which would spend quota), wait for the real title, read
-the cookie jar. A mint whose curl replay is still challenged is served by
-in-page fetch() from the tab instead (some residential exits issue no
-cf_clearance at all, like Envato).
+Identities are minted on the browser box, one throwaway headed Chrome per
+mint through the exit this pod picked (direct, then fresh residential
+ports): load the seed page (the discover page — never an organization
+page, which would spend quota), wait for the real title, read the cookie
+jar. The pool, the organization quota, the TTL, the cooldowns and the curl
+replay validation all stay here. A mint whose curl replay is still
+challenged is served in BROWSER mode instead (some residential exits issue
+no cf_clearance at all, like Envato): every call is an in-page fetch from
+a kept browser on the box (browser_client.fetch_any over the identity's
+burst sessions -> recipes/
+crunchbase_fetch.py), one browser per identity on that identity's exit,
+closed by the box after 300 s idle. No browser runs on GKE.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   CrunchbaseUpstreamError  transport failure / 5xx                — retried
@@ -62,6 +77,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   CrunchbaseNotFound       CS404 / unknown entity                  — never retried
 """
 import json
+import fastjson
 import os
 import sys
 import threading
@@ -73,8 +89,12 @@ from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import browser_client
 import config
+import egress
+from browser_client import BoxRefused, BoxUnavailable
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
+from scraper_utils import debug, fanout, sessions as sessions_utils
 
 SITE = "https://www.crunchbase.com"
 NEWS = "https://news.crunchbase.com"
@@ -84,16 +104,14 @@ FANOUT_WORKERS = 6
 SEED_PATH = "/discover/organization.companies"
 SEARCH_LIMIT = 15          # anonymous maximum rows per search call
 CARD_PAGE = 10             # rows per /cards/<card> call
+BOX_SITE = "crunchbase"            # recipes/crunchbase.py (the mint)
+BOX_FETCH = "crunchbase-fetch"     # recipes/crunchbase_fetch.py (browser mode)
 
 CF_MARKERS = ("just a moment", "one moment, please", "cf-chl", "challenge-platform",
               "attention required! | cloudflare", "access denied | www.crunchbase.com")
-HARVEST_POLL = 0.5
-HARVEST_SETTLE = 1.0
-CLICK_EVERY = 4
-MAX_CLICKS = 4
 
 # The Chrome fingerprint the challenge was solved with; sec-ch-ua must match
-# the user-agent's major version (patchright real Chrome, currently 140).
+# the user-agent's major version (the box's real Chrome).
 _CH_UA = '"Chromium";v="{v}", "Not=A?Brand";v="24", "Google Chrome";v="{v}"'
 
 
@@ -106,7 +124,7 @@ def _ua_major(ua):
 def _headers(ua, kind, referer=SEED_PATH):
     """The header set the SPA sends (kind = json | post | html)."""
     base = {
-        "accept-language": "en-US,en;q=0.9",
+        "accept-language": egress.site_accept_language("crunchbase"),
         "sec-ch-ua": _CH_UA.format(v=_ua_major(ua)),
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"macOS"' if "Macintosh" in (ua or "") else '"Linux"',
@@ -150,14 +168,7 @@ class CrunchbaseNotFound(NotFound):
 
 def dump_debug(name, text):
     """Write a raw response to $CRUNCHBASE_DEBUG_DIR/<name>.txt."""
-    dbg = os.environ.get("CRUNCHBASE_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("CRUNCHBASE_DEBUG_DIR", name, text)
 
 
 # ---- response classification -----------------------------------------------------
@@ -195,19 +206,11 @@ def is_org_path(url):
 # ---- curl sessions -----------------------------------------------------------------
 
 def _new_session(proxy):
-    from curl_cffi import requests as curl_requests
-    sess = curl_requests.Session(impersonate=IMPERSONATE)
-    if proxy:
-        sess.proxies = {"http": proxy, "https": proxy}
-    return sess
+    return sessions_utils.curl_session(IMPERSONATE, proxy)
 
 
 def _close(sess):
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions_utils.close_quietly(sess)
 
 
 _local = threading.local()
@@ -237,17 +240,18 @@ def _drop_session(ident):
 # ---- identities ----------------------------------------------------------------------
 
 class Identity:
-    """One Cloudflare clearance: cookies + user-agent bound to one exit IP."""
-    __slots__ = ("key", "cookies", "ua", "proxy", "mode", "born", "org_uses", "retired", "lock", "generation")
+    """One Cloudflare clearance: cookies + user-agent bound to one exit IP.
+    `key` is also the box session of a browser-mode identity's browser."""
+    __slots__ = ("key", "cookies", "ua", "proxy", "mode", "born", "org_uses", "retired", "lock", "last_used")
 
-    def __init__(self, cookies, ua, proxy, mode, generation):
+    def __init__(self, cookies, ua, proxy, mode):
         self.key = uuidlib.uuid4().hex
         self.cookies, self.ua, self.proxy, self.mode = cookies, ua, proxy, mode
         self.born = time.time()
         self.org_uses = 0
         self.retired = False
         self.lock = threading.Lock()
-        self.generation = generation
+        self.last_used = 0.0           # monotonic; general work goes to the least recently used identity
 
     @property
     def egress(self):
@@ -275,190 +279,65 @@ class _Resp:
         self.status_code, self.text, self.headers, self.url = status_code, text, headers or {}, url
 
     def json(self):
-        return json.loads(self.text)
+        return fastjson.loads(self.text)
 
 
-def _click_turnstile(page):
-    """Real mouse click on the Turnstile checkbox: the widget iframe's
-    bounding box, x at 1/9 of the width (the checkbox), y at the middle.
-    Returns True when a challenge frame was found and clicked."""
-    import random
-    for frame in page.frames:
-        if not frame.url.startswith("https://challenges.cloudflare.com"):
-            continue
-        try:
-            box = frame.frame_element().bounding_box()
-        except Exception:
-            box = None
-        if not box or box.get("width", 0) < 50:
-            continue
-        x = box["x"] + box["width"] / 9 + random.uniform(-5, 5)
-        y = box["y"] + box["height"] / 2 + random.uniform(-5, 5)
-        page.mouse.move(x, y, steps=random.randint(10, 25))
-        page.wait_for_timeout(random.randint(100, 300))
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(50, 150))
-        page.mouse.up()
-        return True
-    return False
+def _egress(proxy):
+    return "direct" if not proxy else proxy.rsplit("@", 1)[-1]
 
 
-class _Browser:
-    """The shared headed Chrome that mints identities (and serves in-page
-    fetches for identities whose cookie does not replay over curl). Every
-    playwright call runs on the driver's owner thread through driver.call()."""
-
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.driver = None
-        self.proxy = None
-        self.generation = 0
-        self.last_used = 0.0
-        self.last_clearance = None
-        self._reaper = None
-
-    def _launch(self, proxy):
-        from chrome_manager import create_scope
-        from patchright_driver import PatchrightDriver
-        self._close_locked()
-        print(f"crunchbase: launching the identity browser "
-              f"(egress={'direct' if not proxy else proxy.rsplit('@', 1)[-1]})")
-        with create_scope():
-            self.driver = PatchrightDriver(proxy_url=proxy, headless=False)
-        self.proxy = proxy
-        self.generation += 1
-        self.last_clearance = None
-        if self._reaper is None:
-            self._reaper = threading.Thread(target=self._reap, name="crunchbase-browser-reaper", daemon=True)
-            self._reaper.start()
-
-    def _close_locked(self):
-        driver, self.driver = self.driver, None
-        if driver is not None:
-            try:
-                driver.close()
-            except Exception:
-                pass
-        _retire_browser_identities()
-
-    def close(self):
-        with self.lock:
-            self._close_locked()
-
-    def _reap(self):
-        while True:
-            time.sleep(30)
-            with self.lock:
-                if self.driver is not None and time.time() - self.last_used > config.CRUNCHBASE_BROWSER_IDLE:
-                    print("crunchbase: closing the idle identity browser")
-                    self._close_locked()
-
-    def mint(self, proxy):
-        """Clear cookies, load the seed page until the real title shows
-        (clicking Turnstile when it appears) -> (cookies, ua, generation).
-        Relaunches when the exit differs or the clearance did not change."""
-        with self.lock:
-            if self.driver is None or self.proxy != proxy:
-                self._launch(proxy)
-            self.last_used = time.time()
-            driver, generation = self.driver, self.generation
-
-            def clear(page):
-                page.context.clear_cookies()
-
-            def goto(page):
-                page.goto(SITE + SEED_PATH, referer="https://www.google.com/",
-                          wait_until="domcontentloaded", timeout=60000)
-
-            def state(page):
-                try:
-                    return page.title() or ""
-                except Exception:
-                    return ""
-
-            started = time.monotonic()
-            driver.call(clear)
-            driver.call(goto)
-            clicks, last_click = 0, None
-            while True:
-                low = driver.call(state).lower()
-                if low and not any(m in low for m in CF_MARKERS):
-                    time.sleep(HARVEST_SETTLE)
-                    break
-                if "attention required" in low or "access denied" in low:
-                    raise RuntimeError(f"Cloudflare refuses this exit: {low[:60]}")
-                elapsed = time.monotonic() - started
-                if elapsed > config.CRUNCHBASE_HARVEST_TIMEOUT:
-                    raise RuntimeError(f"Cloudflare challenge did not clear (clicks={clicks})")
-                due = (last_click is None and elapsed >= 3) or \
-                      (last_click is not None and time.monotonic() - last_click >= CLICK_EVERY)
-                try:
-                    clicked = due and clicks < MAX_CLICKS and driver.call(_click_turnstile)
-                except Exception:
-                    clicked = False          # the frame navigated under the click
-                if clicked:
-                    clicks += 1
-                    last_click = time.monotonic()
-                time.sleep(HARVEST_POLL)
-            # Cloudflare reloads the page right after it clears, so an evaluate
-            # can land mid-navigation ("Execution context was destroyed"):
-            # retry until the new document answers.
-            ua = None
-            for _ in range(10):
-                try:
-                    ua = driver.evaluate("navigator.userAgent")
-                    break
-                except Exception:
-                    time.sleep(1)
-            if not ua:
-                raise RuntimeError("the page never settled after the challenge")
-            cookies = {c["name"]: c["value"] for c in driver.call(lambda page: page.context.cookies(SITE))}
-            clearance = cookies.get("cf_clearance")
-            if clearance and clearance == self.last_clearance:
-                # the context kept its clearance: only a relaunch yields a new one
-                self._launch(proxy)
-                return self.mint(proxy)
-            self.last_clearance = clearance
-            print(f"crunchbase: identity minted in {time.monotonic() - started:.0f}s "
-                  f"(clicks={clicks}, cf_clearance={'yes' if clearance else 'no'}, "
-                  f"egress={'direct' if not proxy else proxy.rsplit('@', 1)[-1]})")
-            return cookies, ua, generation
-
-    def fetch(self, method, url, headers, body, generation):
-        """In-page fetch() from the tab -> _Resp; raises _StaleBrowser when
-        the browser that minted the identity is gone."""
-        from patchright_driver import _FETCH_JS, FETCH_TIMEOUT_MS
-        with self.lock:
-            if self.driver is None or self.generation != generation:
-                raise _StaleBrowser()
-            driver = self.driver
-            self.last_used = time.time()
-            res = driver.call(lambda page: page.evaluate(_FETCH_JS, {
-                "url": url, "method": method, "headers": headers, "body": body,
-                "referrer": SITE + SEED_PATH, "timeoutMs": FETCH_TIMEOUT_MS}))
-        if not res or not res.get("ok"):
-            raise CrunchbaseUpstreamError(f"in-page fetch failed: {(res or {}).get('error')}")
-        return _Resp(int(res.get("status") or 0), res.get("body") or "", res.get("headers"), res.get("url") or url)
+def _box_mint(proxy):
+    """One mint on the browser box through `proxy` (recipes/crunchbase.py:
+    a throwaway headed Chrome loads the discover page until the real title
+    shows) -> (cookies, ua). RuntimeError when the box could not clear this
+    exit (the caller moves to the next one); CrunchbaseUpstreamError when
+    the box itself is down (not a block: no exit cooling, no cooldown)."""
+    try:
+        ident = browser_client.mint(BOX_SITE, proxy=proxy)
+    except BoxRefused as e:
+        raise RuntimeError(f"the box could not clear this exit: {e}")
+    except BoxUnavailable as e:
+        raise CrunchbaseUpstreamError(f"browser box unavailable: {e}")
+    cookies = {c["name"]: c["value"] for c in ident.get("cookies") or []}
+    ua = ident.get("user_agent")
+    if not ua:
+        raise RuntimeError("the box answered without a user-agent")
+    print(f"crunchbase: identity minted on the box (cf_clearance="
+          f"{'yes' if 'cf_clearance' in cookies else 'no'}, egress={_egress(proxy)})")
+    return cookies, ua
 
 
-class _StaleBrowser(Exception):
-    pass
+def _box_candidates(ident):
+    """The kept browsers the box may serve this identity's call from:
+    INPAGE_BROWSER_SLOTS x BROWSER_BURST_FACTOR sessions "<identity key>#i"
+    on the identity's exit (one browser per identity until 2026-11-04). The
+    key in the session keeps a retired identity from ever reusing a browser
+    whose cookie spent its organization quota; the box picks an idle one
+    or opens another while it has headroom."""
+    return [(ident.proxy, f"{ident.key}#{i}")
+            for i in range(config.burst_slots(config.INPAGE_BROWSER_SLOTS))]
 
 
-_browser = _Browser()
+def _box_fetch(ident, method, url, headers, body):
+    """In-page fetch from one of the identity's kept browsers on the box
+    (recipes/crunchbase_fetch.py, _box_candidates) -> _Resp. A BoxRefused
+    propagates: _once reads its verdict (rate-limited / challenged) the way
+    it reads a curl reply's."""
+    try:
+        _i, res = browser_client.fetch_any(BOX_FETCH, _box_candidates(ident), url=url, method=method,
+                                           headers=headers, body=body)
+    except BoxUnavailable as e:
+        raise CrunchbaseUpstreamError(f"in-page fetch failed: {e}")
+    return _Resp(int(res.get("status") or 0), res.get("body") or "", res.get("headers"),
+                 res.get("final_url") or url)
+
+
 _pool_lock = threading.Lock()
 _identities = deque()                # live identities, oldest first
-_mint_lock = threading.Lock()        # one mint at a time
+_mint_slots = threading.BoundedSemaphore(config.CRUNCHBASE_PARALLEL_MINTS)   # mints in flight at once
 _egress_cooling = {}                 # egress -> epoch when usable again
 _failed_until = 0.0                  # every mint attempt failed recently
 _spare_thread = {"t": None}
-
-
-def _retire_browser_identities():
-    with _pool_lock:
-        for ident in _identities:
-            if ident.mode == "browser":
-                ident.retired = True
 
 
 def egress_cooling(egress):
@@ -512,18 +391,20 @@ def _mint():
     last = None
     for proxy in _candidate_exits():
         try:
-            cookies, ua, generation = _browser.mint(proxy)
+            cookies, ua = _box_mint(proxy)
+        except CrunchbaseUpstreamError:
+            raise                        # the box is down: retried by request(), no exit is blamed
         except Exception as e:
             last = e
-            print(f"crunchbase: mint on {'direct' if not proxy else proxy.rsplit('@', 1)[-1]} failed: "
+            print(f"crunchbase: mint on {_egress(proxy)} failed: "
                   f"{type(e).__name__}: {str(e).splitlines()[0][:160]}")
             if proxy is None:
                 _cool_egress("direct", config.CRUNCHBASE_RATE_LIMIT_COOLDOWN)
             continue
         mode = "curl" if _curl_validates(cookies, ua, proxy) else "browser"
         if mode == "browser":
-            print("crunchbase: the minted cookie does not replay over curl; serving it in-page")
-        ident = Identity(cookies, ua, proxy, mode, generation)
+            print("crunchbase: the minted cookie does not replay over curl; serving it in-page on the box")
+        ident = Identity(cookies, ua, proxy, mode)
         with _pool_lock:
             _identities.append(ident)
         return ident
@@ -540,56 +421,106 @@ def _prune():
 
 
 def _pick(need_org):
-    """A live identity on a non-cooling egress with organization quota left
-    (when need_org), preferring the one with the most quota so cookies are
-    spent evenly and the freshest survives longest."""
+    """A live identity on a non-cooling egress, ready for one request.
+
+    Organization work: the identity with the most quota left (cookies are
+    spent evenly, the freshest survives longest), with its unit RESERVED
+    here under the pool lock: until 2026-11-04 the reservation came after
+    the pick, so concurrent callers raced for a cookie's last units and
+    every loser burned one of its four attempts. General work (searches,
+    people, events...): the least recently used identity, so it spreads
+    over every live cookie and exit instead of landing on the oldest one
+    and its ~150-200 / 10 min per-IP limit."""
     with _pool_lock:
-        best = None
-        for ident in _identities:
-            if ident.retired or ident.expired() or egress_cooling(ident.egress):
-                continue
-            if need_org and ident.org_left() <= 0:
-                continue
-            if best is None or (need_org and ident.org_left() > best.org_left()):
-                best = ident
+        live = [i for i in _identities if not i.retired and not i.expired() and not egress_cooling(i.egress)]
+        if need_org:
+            best = None
+            for ident in live:
+                if ident.org_left() > 0 and (best is None or ident.org_left() > best.org_left()):
+                    best = ident
+            if best is not None and not best.take_org():
+                return None
+        else:
+            best = min(live, key=lambda i: i.last_used, default=None)
+        if best is not None:
+            best.last_used = time.monotonic()
         return best
+
+
+def _org_left_total():
+    with _pool_lock:
+        return sum(i.org_left() for i in _identities if not i.retired and not i.expired())
+
+
+def _live_count():
+    with _pool_lock:
+        return sum(1 for i in _identities if not i.retired and not i.expired() and not egress_cooling(i.egress))
+
+
+def _background_mint(reason, still_needed):
+    """One mint on a background thread (never two at once) unless the pool
+    is cooling after a failed round; `still_needed()` is re-checked once
+    the thread holds a mint slot, in case a foreground mint landed first."""
+    def run():
+        with _mint_slots:
+            if not still_needed():
+                return
+            try:
+                _mint()
+            except Exception as e:
+                print(f"crunchbase: background mint ({reason}) failed: {e}")
+
+    # the alive check and the registration are one step under the lock:
+    # two callers seeing "not alive" at once would both start a thread
+    with _pool_lock:
+        alive = _spare_thread["t"] is not None and _spare_thread["t"].is_alive()
+        if alive or time.time() < _failed_until:
+            return
+        t = threading.Thread(target=run, name="crunchbase-spare-mint", daemon=True)
+        _spare_thread["t"] = t
+    t.start()
 
 
 def _ensure_spare():
     """Mint a fresh identity in the background when every live one has
     little organization quota left, so the next profile does not wait."""
-    with _pool_lock:
-        left = sum(i.org_left() for i in _identities if not i.retired and not i.expired())
-        alive = _spare_thread["t"] is not None and _spare_thread["t"].is_alive()
-    if left > config.CRUNCHBASE_ORG_QUOTA // 2 or alive or time.time() < _failed_until:
+    half = config.CRUNCHBASE_ORG_QUOTA // 2
+    if _org_left_total() > half:
         return
+    _background_mint("organization quota low", lambda: _org_left_total() <= half)
 
-    def run():
-        with _mint_lock:
-            if _pick(True) is not None and sum(i.org_left() for i in _identities if not i.retired) > config.CRUNCHBASE_ORG_QUOTA // 2:
-                return
-            try:
-                _mint()
-            except Exception as e:
-                print(f"crunchbase: background mint failed: {e}")
-    t = threading.Thread(target=run, name="crunchbase-spare-mint", daemon=True)
-    _spare_thread["t"] = t
-    t.start()
+
+def _grow_pool():
+    """Under traffic, keep CRUNCHBASE_IDENTITIES live identities (minted
+    one at a time in the background, never while idle) so general work
+    has that many cookies and exits to spread over."""
+    if _live_count() >= config.CRUNCHBASE_IDENTITIES:
+        return
+    _background_mint("pool below CRUNCHBASE_IDENTITIES", lambda: _live_count() < config.CRUNCHBASE_IDENTITIES)
 
 
 def acquire(need_org):
-    """An identity ready for one request (mints when none qualifies)."""
+    """An identity ready for one request (its organization unit reserved
+    when need_org); mints when none qualifies, up to
+    CRUNCHBASE_PARALLEL_MINTS mints at once, callers past that waiting for
+    a slot and re-checking the pool first (a mint that just landed usually
+    serves them without one of their own)."""
     _prune()
     ident = _pick(need_org)
     if ident is not None:
+        _grow_pool()
         return ident
     if time.time() < _failed_until:
         raise CrunchbaseBlocked("Cloudflare would not clear on any exit recently; retrying after the cooldown")
-    with _mint_lock:
+    with _mint_slots:
         ident = _pick(need_org)
         if ident is not None:
             return ident
-        return _mint()
+        ident = _mint()
+        if need_org:
+            ident.take_org()
+        ident.last_used = time.monotonic()
+        return ident
 
 
 def retire(ident, reason):
@@ -608,24 +539,28 @@ def _once(method, url, body, kind):
     spent organization quota or a dead cookie); error 1015 cools the egress."""
     need_org = is_org_path(url)
     for attempt in range(4):
-        ident = acquire(need_org)
-        if need_org and not ident.take_org():
-            continue
+        ident = acquire(need_org)        # its organization unit already reserved (when need_org)
         headers = _headers(ident.ua, kind)
         try:
             if ident.mode == "browser":
-                resp = _browser.fetch(method, url, {k: v for k, v in headers.items()
-                                                    if k in ("accept", "content-type", "x-requested-with",
-                                                             "x-cb-client-app-instance-id")},
-                                      body, ident.generation)
+                resp = _box_fetch(ident, method, url, {k: v for k, v in headers.items()
+                                                       if k in ("accept", "content-type", "x-requested-with",
+                                                                "x-cb-client-app-instance-id")}, body)
             else:
                 sess = _session_for(ident)
                 if method == "POST":
                     resp = sess.post(url, headers=headers, cookies=ident.cookies, data=body, timeout=TIMEOUT)
                 else:
                     resp = sess.get(url, headers=headers, cookies=ident.cookies, timeout=TIMEOUT)
-        except _StaleBrowser:
-            retire(ident, "browser gone")
+        except BoxRefused as e:
+            # The box dropped that identity's browser on a 403/429. Its
+            # message carries the verdict (recipes/crunchbase_fetch.py):
+            # error 1015 cools the egress, anything else is a dead cookie /
+            # spent quota, exactly as the curl replies below.
+            if "rate-limited" in str(e):
+                _cool_egress(ident.egress, config.CRUNCHBASE_RATE_LIMIT_COOLDOWN)
+            else:
+                retire(ident, "quota spent" if need_org else "cookie challenged")
             continue
         except CrunchbaseUpstreamError:
             raise
@@ -895,7 +830,7 @@ def news_json(path, params=None):
     for attempt in range(1, config.MAX_RETRIES + 1):
         try:
             resp = curl_requests.get(url, impersonate=IMPERSONATE, timeout=TIMEOUT,
-                                     headers={"accept": "application/json", "accept-language": "en-US,en;q=0.9"})
+                                     headers={"accept": "application/json", "accept-language": egress.site_accept_language("crunchbase")})
         except Exception as e:
             last = CrunchbaseUpstreamError(f"news request failed: {type(e).__name__}: {e}")
         else:
@@ -918,12 +853,7 @@ def news_json(path, params=None):
 
 def run_parallel(fns, workers=FANOUT_WORKERS):
     """Run zero-arg callables concurrently, results in order; exceptions propagate."""
-    if not fns:
-        return []
-    if len(fns) == 1:
-        return [fns[0]()]
-    with ThreadPoolExecutor(max_workers=min(workers, len(fns))) as pool:
-        return list(pool.map(lambda f: f(), fns))
+    return fanout.per_call_map(fns, workers)
 
 
 def run_parallel_quiet(fns, workers=FANOUT_WORKERS):

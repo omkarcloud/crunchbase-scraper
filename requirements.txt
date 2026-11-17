@@ -6,3 +6,5 @@ patchright
 psutil
 pyvirtualdisplay
 pytest
+browserforge
+requests
